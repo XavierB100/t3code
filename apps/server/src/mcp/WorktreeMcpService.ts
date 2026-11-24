@@ -179,7 +179,11 @@ const make = Effect.gen(function* () {
 
     const project = yield* loadProject(scope, projection.thread.projectId);
     const projectCwd = project.workspaceRoot;
-    const projectCommands = TaskFolders.linkRunsProjectCommands(projection.thread.linkOrigin);
+    // The agent asks, so its thread's modes decide what of the project's own code runs for it.
+    const projectCommands = TaskFolders.projectCommandsForAgent(
+      projection.thread.linkOrigin,
+      projection.thread,
+    );
 
     // A project that tracks repositories moves into a task folder: its own folder, which need
     // not be a repository, and a worktree of each tracked one.
@@ -406,7 +410,10 @@ const make = Effect.gen(function* () {
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach);
 
         let setupScript: WorktreeMcpSetupScriptStatus = { status: "skipped" };
-        if (input.runSetupScript ?? true) {
+        // The saved setup script is the project's code too: below Full access it waits for a person.
+        const setupWaitsForFullAccess =
+          (input.runSetupScript ?? true) && projectCommands === "agent-below-full-access";
+        if ((input.runSetupScript ?? true) && !setupWaitsForFullAccess) {
           setupScript = yield* setupScriptRunner
             .runForThread({
               threadId: scope.thread.threadId,
@@ -442,10 +449,15 @@ const make = Effect.gen(function* () {
           startedFromOrigin,
           setupScript,
           continuation,
-          note:
+          note: `${
             continuation.status === "scheduled"
               ? "Handoff recorded. Changing the workspace detaches this provider session, so the current turn ends shortly after this call; the queued continuation prompt then starts the next turn inside the worktree with the conversation preserved. The worktree is not removed automatically when the thread is deleted."
-              : "Handoff recorded. Changing the workspace detaches this provider session, so the current turn ends shortly after this call; the conversation continues inside the worktree when the thread receives its next message. Pass continuationPrompt to resume automatically. The worktree is not removed automatically when the thread is deleted.",
+              : "Handoff recorded. Changing the workspace detaches this provider session, so the current turn ends shortly after this call; the conversation continues inside the worktree when the thread receives its next message. Pass continuationPrompt to resume automatically. The worktree is not removed automatically when the thread is deleted."
+          }${
+            setupWaitsForFullAccess
+              ? " Project setup scripts do not run for a handoff from a thread below Full access."
+              : ""
+          }`,
         };
         return result;
       }),

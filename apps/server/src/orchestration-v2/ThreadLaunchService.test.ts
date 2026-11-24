@@ -70,6 +70,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as TaskFolders from "../workspace/TaskFolders.ts";
 import {
+  approveLayoutCommands,
   layerTaskFoldersWithGit,
   type TaskFoldersTestState,
 } from "../workspace/TaskFolders.testkit.ts";
@@ -2999,51 +3000,68 @@ it.effect("cancels tracked setup before provider work is released", () =>
   }),
 );
 
+// A project whose approved layout command leaves a line in `ran` each time it runs.
+const withLayoutProject = <A, E>(
+  test: (context: {
+    readonly ran: Effect.Effect<string>;
+    readonly harness: ReturnType<typeof makeHarness>;
+  }) => Effect.Effect<A, E, Layer.Success<ReturnType<typeof makeHarness>["layer"]>>,
+) => {
+  const state: TaskFoldersTestState = { workspaceRoot: "/unset", trackedFolders: [], thread: null };
+  const layerGit = GitVcsDriver.layer.pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-launch-layout-" })),
+    Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  );
+  const layerTaskFolders = layerTaskFoldersWithGit(state).pipe(
+    Layer.provide(layerGit),
+    Layer.orDie,
+  );
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const git = yield* GitVcsDriver.GitVcsDriver;
+    const tmp = yield* fileSystem.realPath(
+      yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-launch-layout-" }),
+    );
+    const shop = path.join(tmp, "shop");
+    const ran = path.join(tmp, "ran");
+    yield* fileSystem.makeDirectory(shop);
+    for (const args of [
+      ["init", "-b", "main"],
+      ["config", "user.email", "launch@example.test"],
+      ["config", "user.name", "Launch"],
+      ["commit", "--allow-empty", "-m", "initial"],
+    ]) {
+      yield* git.execute({ operation: "launch-test", cwd: shop, args });
+    }
+    yield* fileSystem.writeFileString(
+      path.join(shop, "t3.json"),
+      JSON.stringify({
+        worktreeLayout: {
+          create: `echo create >> "${ran}" && git worktree add -q -b "$T3_WORKTREE_BRANCH" "$T3_WORKTREE_PROJECT_PATH"`,
+        },
+      }),
+    );
+    state.workspaceRoot = shop;
+    yield* Effect.gen(function* () {
+      yield* approveLayoutCommands;
+      // The one service the approval was recorded with, not a second one with its own records.
+      const harness = makeHarness({
+        taskFolders: Layer.succeed(TaskFolders.TaskFolders, yield* TaskFolders.TaskFolders),
+      });
+      return yield* test({
+        ran: fileSystem.readFileString(ran).pipe(Effect.orElseSucceed(() => "")),
+        harness,
+      }).pipe(Effect.provide(harness.layer));
+    }).pipe(Effect.provide(layerTaskFolders));
+  }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, layerGit)), Effect.scoped);
+};
+
 it.live(
   "a thread started through a link below full access gets no worktree from a project's layout command",
-  () => {
-    const state: TaskFoldersTestState = {
-      workspaceRoot: "/unset",
-      trackedFolders: [],
-      thread: null,
-    };
-    const layerGit = GitVcsDriver.layer.pipe(
-      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-launch-layout-" })),
-      Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-    );
-    const layerTaskFolders = layerTaskFoldersWithGit(state).pipe(
-      Layer.provide(layerGit),
-      Layer.orDie,
-    );
-    return Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const git = yield* GitVcsDriver.GitVcsDriver;
-      const tmp = yield* fileSystem.realPath(
-        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-launch-layout-" }),
-      );
-      const shop = path.join(tmp, "shop");
-      const ran = path.join(tmp, "ran");
-      yield* fileSystem.makeDirectory(shop);
-      for (const args of [
-        ["init", "-b", "main"],
-        ["config", "user.email", "launch@example.test"],
-        ["config", "user.name", "Launch"],
-        ["commit", "--allow-empty", "-m", "initial"],
-      ]) {
-        yield* git.execute({ operation: "launch-test", cwd: shop, args });
-      }
-      yield* fileSystem.writeFileString(
-        path.join(shop, "t3.json"),
-        JSON.stringify({
-          worktreeLayout: {
-            create: `echo create >> "${ran}" && git worktree add -q -b "$T3_WORKTREE_BRANCH" "$T3_WORKTREE_PROJECT_PATH"`,
-          },
-        }),
-      );
-      state.workspaceRoot = shop;
-      const harness = makeHarness({ taskFolders: layerTaskFolders });
-      yield* Effect.gen(function* () {
+  () =>
+    withLayoutProject(({ ran }) =>
+      Effect.gen(function* () {
         const launches = yield* ThreadLaunch.ThreadLaunchService;
         const launch = Effect.fnUntraced(function* (
           name: string,
@@ -3066,7 +3084,7 @@ it.live(
         const limited = yield* launch("limited", "auto-accept-edits");
         assert.equal(limited.runs[0]?.status, "failed");
         assert.isNull(limited.thread.worktreePath);
-        assert.isFalse(yield* fileSystem.exists(ran));
+        assert.equal(yield* ran, "");
 
         // Preparing the same run again reads the link from the thread, not from a request.
         const threads = yield* ThreadManagement.ThreadManagementService;
@@ -3085,7 +3103,7 @@ it.live(
           Stream.take(2),
           Stream.runDrain,
         );
-        assert.isFalse(yield* fileSystem.exists(ran));
+        assert.equal(yield* ran, "");
 
         // A first message sent into an empty thread the link started names no link; the
         // thread's own link still decides.
@@ -3121,13 +3139,137 @@ it.live(
         const reused = yield* preparationSettled(emptyThreadId);
         assert.equal(reused.runs[0]?.status, "failed");
         assert.isNull(reused.thread.worktreePath);
-        assert.isFalse(yield* fileSystem.exists(ran));
+        assert.equal(yield* ran, "");
 
         const full = yield* launch("full", "full-access");
         assert.equal(full.runs[0]?.status, "starting");
-        assert.equal(yield* fileSystem.readFileString(ran), "create\n");
-      }).pipe(Effect.provide(harness.layer));
-    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, layerGit)), Effect.scoped);
+        assert.equal(yield* ran, "create\n");
+      }),
+    ),
+);
+
+it.live(
+  "an agent's launch runs a project's approved layout command only when the thread that asked is in Full access",
+  () =>
+    withLayoutProject(({ ran }) =>
+      Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const asker = Effect.fnUntraced(function* (
+          name: string,
+          runtimeMode: "full-access" | "auto",
+        ) {
+          const threadId = ThreadId.make(`thread:asker-${name}`);
+          yield* threads.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`asker:${name}`),
+            threadId,
+            projectId,
+            title: "Asker",
+            modelSelection,
+            runtimeMode,
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          return threadId;
+        });
+        const launch = Effect.fnUntraced(function* (
+          name: string,
+          runtimeMode: "full-access" | "auto",
+          senderThreadId?: ThreadId,
+        ) {
+          const input = launchInput({
+            command: `launch:${name}`,
+            thread: `thread:${name}`,
+            message: "Start",
+            workspace: { type: "worktree", baseRef: "main", branch: `feature/${name}` },
+          });
+          const launched = yield* launches.launch({
+            ...input,
+            runtimeMode,
+            initialMessage: {
+              ...input.initialMessage!,
+              ...(senderThreadId === undefined ? {} : { senderThreadId }),
+            },
+            createdBy: "agent",
+            creationSource: "mcp",
+          });
+          return yield* preparationSettled(launched.threadId);
+        });
+
+        // No thread asked, so the new thread's own modes stand in for whoever did.
+        const unnamed = yield* launch("unnamed", "auto");
+        assert.equal(unnamed.runs[0]?.status, "failed");
+        assert.isNull(unnamed.thread.worktreePath);
+        assert.equal(yield* ran, "");
+
+        const below = yield* launch("below", "auto", yield* asker("below", "auto"));
+        assert.equal(below.runs[0]?.status, "failed");
+        assert.equal(yield* ran, "");
+
+        // Preparing the run again is still the agent's request.
+        yield* launches.retryPreparation({
+          commandId: CommandId.make("launch:below:retry"),
+          threadId: below.thread.id,
+          runId: below.runs[0]!.id,
+        });
+        yield* threads.streamStoredEventsFrom({ threadId: below.thread.id }).pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "run.updated" &&
+              (stored.commandId?.endsWith(":release") === true ||
+                stored.event.payload.status === "failed"),
+          ),
+          Stream.take(2),
+          Stream.runDrain,
+        );
+        assert.equal(yield* ran, "");
+
+        // A Full access thread may start a narrower one in a worktree.
+        const above = yield* launch("above", "auto", yield* asker("above", "full-access"));
+        assert.equal(above.runs[0]?.status, "starting");
+        assert.equal(yield* ran, "create\n");
+      }),
+    ),
+);
+
+it.effect(
+  "an agent's launch from a thread below Full access leaves the project's setup script unrun",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const tracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+      const launch = Effect.fnUntraced(function* (
+        name: string,
+        runtimeMode: "full-access" | "approval-required",
+      ) {
+        const launched = yield* launches.launch({
+          ...launchInput({
+            command: `launch:${name}`,
+            thread: `thread:${name}`,
+            message: "Start",
+            workspace: { type: "worktree", baseRef: "main", branch: `feature/${name}` },
+          }),
+          runtimeMode,
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        yield* preparationSettled(launched.threadId);
+        return (yield* tracker.get(launched.threadId))?.stages.find(
+          (stage) => stage.id === "setup-script",
+        )?.status;
+      });
+
+      assert.equal(yield* launch("supervised", "approval-required"), "skipped");
+      assert.equal(harness.runSetup.mock.calls.length, 0);
+
+      yield* launch("full", "full-access");
+      assert.equal(harness.runSetup.mock.calls.length, 1);
+    }).pipe(Effect.provide(harness.layer));
   },
 );
 
